@@ -1,0 +1,46 @@
+services:
+  db:
+    image: postgres:18     # ★変更
+    container_name: pgsql
+    environment:
+      POSTGRES_USER: pgsql_user
+      POSTGRES_PASSWORD: k&4h=mH,KyL7mcZ
+      POSTGRES_DB: ajito_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - db-data:/var/lib/postgresql
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - ajito_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pgsql_user -d ajito_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build: ./backend
+    container_name: ajito_backend
+    ports:
+      - "8080:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DB_HOST: db
+      DB_USER: pgsql_user
+      DB_PASSWORD: k&4h=mH,KyL7mcZ
+      DB_NAME: ajito_db
+    networks:
+      - ajito_net
+    volumes:
+      - .:/app@
+      - ./backend/uploads:/app/uploads
+
+volumes:
+  db-data:
+
+networks:
+  ajito_net:
+    driver: bridge

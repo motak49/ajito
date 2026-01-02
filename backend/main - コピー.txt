@@ -1,0 +1,387 @@
+package main
+
+import (
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"time"
+
+	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v4/middleware"
+	"github.com/lib/pq"
+	_ "github.com/lib/pq"
+)
+
+var db *sql.DB
+
+type User struct {
+	Username    string    `json:"username"`
+	DisplayName string    `json:"display_name"`
+	Bio         string    `json:"bio"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
+type Event struct {
+	ID        int       `json:"id"`
+	Title     string    `json:"title"`
+	Category  string    `json:"category"`
+	EventDate time.Time `json:"event_date"`
+}
+
+type Activity struct {
+	ID           int                    `json:"id"`
+	UserID       string                 `json:"user_id"`
+	Category     string                 `json:"category"`
+	EventID      *int                   `json:"event_id"`
+	PlayedAt     time.Time              `json:"played_at"`
+	Prefecture   string                 `json:"prefecture"`
+	LocationName string                 `json:"location_name"`
+	PrimaryScore float64                `json:"primary_score"`
+	ImageURLs    []string               `json:"image_urls"`
+	Details      map[string]interface{} `json:"details"`
+	
+	// --- 追加: 同伴者フィールド ---
+	CoPlayerIDs   []string `json:"co_player_ids"`   // リクエスト用（同伴者のusernameリスト）
+	CoPlayerNames []string `json:"co_player_names"` // レスポンス用（表示名のリスト）
+}
+
+type Ranking struct {
+	UserID      string  `json:"user_id"`
+	DisplayName string  `json:"display_name"`
+	AvgScore    float64 `json:"avg_score"`
+	BestScore   float64 `json:"best_score"`
+	PlayCount   int     `json:"play_count"`
+}
+
+func main() {
+	var err error
+	// 必要に応じて接続情報を変更してください
+	// 環境変数がセットされていればそれを使い、なければデフォルト(localhost)を使う
+	dbUser := os.Getenv("DB_USER")
+	if dbUser == "" { dbUser = "pgsql_user" } // デフォルト値
+
+	dbPass := os.Getenv("DB_PASSWORD")
+	if dbPass == "" { dbPass = "k&4h=mH,KyL7mcZ" }
+
+	dbHost := os.Getenv("DB_HOST")
+	if dbHost == "" { dbHost = "127.0.0.1" } // Docker内なら "db" になる
+
+	dbName := os.Getenv("DB_NAME")
+	if dbName == "" { dbName = "ajito_db" }
+
+	// 接続文字列を組み立てる
+	connStr := fmt.Sprintf("postgres://%s:%s@%s:5432/%s?sslmode=disable", dbUser, dbPass, dbHost, dbName)
+
+	// ★デバッグ用：どんな設定でつなごうとしているか表示する
+	fmt.Println("--------------------------------------------------")
+	fmt.Printf("接続トライ: Host=%s, User=%s, DB=%s\n", dbHost, dbUser, dbName)
+	fmt.Println("--------------------------------------------------")
+
+	// ▲▲▲ ここまで ▲▲▲
+
+	// 少し待機（DBの起動が遅い場合があるため）
+	time.Sleep(3 * time.Second)
+
+	db, err = sql.Open("postgres", connStr)
+
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+
+	if err = db.Ping(); err != nil {
+		log.Fatal("DB接続エラー:", err)
+	}
+	fmt.Println("?? PostgreSQLに接続成功！")
+
+	e := echo.New()
+	e.Use(middleware.Logger())
+	e.Use(middleware.Recover())
+
+	// ▼▼▼ この1行を追加してください！ ▼▼▼
+	// これで、どの場所（Flutterアプリ等）からでも接続できるようになります
+	e.Use(middleware.CORS())
+
+	e.POST("/v1/users", createUser)
+	e.GET("/v1/users/:username", getUser)
+
+	e.POST("/v1/events", createEvent)
+	e.POST("/v1/activities", createActivity)
+	e.GET("/v1/activities", getActivities)
+	e.GET("/v1/ranking", getRanking)
+
+	e.Logger.Fatal(e.Start(":8080"))
+}
+
+func createUser(c echo.Context) error {
+	u := new(User)
+	if err := c.Bind(u); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "Invalid request"})
+	}
+	if u.Username == "" || u.DisplayName == "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "Username and DisplayName are required"})
+	}
+	if u.CreatedAt.IsZero() {
+		u.CreatedAt = time.Now()
+	}
+	query := `INSERT INTO users (username, display_name, bio, created_at) VALUES ($1, $2, $3, $4) RETURNING created_at`
+	err := db.QueryRow(query, u.Username, u.DisplayName, u.Bio, u.CreatedAt).Scan(&u.CreatedAt)
+	if err != nil {
+		pqErr, ok := err.(*pq.Error)
+		if ok && pqErr.Code == "23505" {
+			return c.JSON(http.StatusConflict, map[string]string{"error": "Username already exists"})
+		}
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+	}
+	return c.JSON(http.StatusCreated, u)
+}
+
+func getUser(c echo.Context) error {
+	username := c.Param("username")
+	u := User{}
+	query := `SELECT username, display_name, bio, created_at FROM users WHERE username = $1`
+	err := db.QueryRow(query, username).Scan(&u.Username, &u.DisplayName, &u.Bio, &u.CreatedAt)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "User not found"})
+		}
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+	}
+	return c.JSON(http.StatusOK, u)
+}
+
+func createEvent(c echo.Context) error {
+	ev := new(Event)
+	if err := c.Bind(ev); err != nil {
+		return err
+	}
+	if ev.EventDate.IsZero() {
+		ev.EventDate = time.Now()
+	}
+	query := `INSERT INTO events (title, category, event_date) VALUES ($1, $2, $3) RETURNING id`
+	err := db.QueryRow(query, ev.Title, ev.Category, ev.EventDate).Scan(&ev.ID)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+	}
+	return c.JSON(http.StatusCreated, ev)
+}
+
+// --- 変更: トランザクション対応 & 同伴者登録 ---
+func createActivity(c echo.Context) error {
+	a := new(Activity)
+	if err := c.Bind(a); err != nil {
+		return err
+	}
+
+	// 1. ユーザー存在チェック
+	var exists bool
+	err := db.QueryRow("SELECT EXISTS(SELECT 1 FROM users WHERE username=$1)", a.UserID).Scan(&exists)
+	if err != nil || !exists {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "User does not exist."})
+	}
+
+	if a.PlayedAt.IsZero() {
+		a.PlayedAt = time.Now()
+	}
+	detailsJSON, _ := json.Marshal(a.Details)
+
+	// 2. トランザクション開始
+	tx, err := db.Begin()
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "Transaction begin failed"})
+	}
+	// エラーが起きたらロールバック、成功したらコミット
+	defer func() {
+		if p := recover(); p != nil {
+			tx.Rollback()
+			panic(p)
+		} else if err != nil {
+			tx.Rollback()
+		} else {
+			err = tx.Commit()
+		}
+	}()
+
+	// 3. アクティビティ本体のINSERT
+	query := `
+		INSERT INTO activities (user_id, category, event_id, played_at, prefecture, location_name, primary_score, image_urls, details)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		RETURNING id`
+	err = tx.QueryRow(query,
+		a.UserID, a.Category, a.EventID, a.PlayedAt, a.Prefecture, a.LocationName, a.PrimaryScore,
+		pq.Array(a.ImageURLs),
+		string(detailsJSON),
+	).Scan(&a.ID)
+
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+	}
+
+	// 4. 同伴者(Participants)のINSERT
+	if len(a.CoPlayerIDs) > 0 {
+		stmt, stmtErr := tx.Prepare("INSERT INTO activity_participants (activity_id, user_id) VALUES ($1, $2)")
+		if stmtErr != nil {
+			err = stmtErr
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "Prepare failed"})
+		}
+		defer stmt.Close()
+
+		for _, coPlayerID := range a.CoPlayerIDs {
+			// 自分自身を含んでいたらスキップなどのロジックはお好みで
+			if _, execErr := stmt.Exec(a.ID, coPlayerID); execErr != nil {
+				// 存在しないユーザーを指定した場合などはここでエラーになる（FK制約がある場合）
+				err = execErr
+				return c.JSON(http.StatusBadRequest, map[string]string{"error": fmt.Sprintf("Failed to add co-player %s: %v", coPlayerID, execErr)})
+			}
+		}
+	}
+
+	// createActivity関数終了時に defer で Commit が走る
+	// (レスポンスには便宜上リクエストのCoPlayerIDsをそのまま返すか、必要ならNamesを入れる)
+	return c.JSON(http.StatusCreated, a)
+}
+
+// --- 変更: 一覧取得時に同伴者名も取得 ---
+func getActivities(c echo.Context) error {
+	category := c.QueryParam("category")
+	filterKey := c.QueryParam("filter_key")
+	filterValue := c.QueryParam("filter_value")
+	eventID := c.QueryParam("event_id")
+
+	// SQL構築: サブクエリを使って同伴者の表示名を配列で取得する
+	// COALESCE(..., '{}') はNULLの場合に空配列を返すためのおまじない
+	sqlStr := `
+		SELECT 
+			a.id, a.user_id, a.category, a.event_id, a.played_at, a.prefecture, a.location_name, a.primary_score, a.image_urls, a.details,
+			COALESCE(
+				(SELECT array_agg(u.display_name) 
+				 FROM activity_participants ap 
+				 JOIN users u ON ap.user_id = u.username 
+				 WHERE ap.activity_id = a.id), 
+				'{}'
+			) as co_player_names
+		FROM activities a 
+		WHERE 1=1`
+
+	args := []interface{}{}
+	argCount := 1
+
+	if category != "" {
+		sqlStr += fmt.Sprintf(" AND a.category = $%d", argCount)
+		args = append(args, category)
+		argCount++
+	}
+	if eventID != "" {
+		sqlStr += fmt.Sprintf(" AND a.event_id = $%d", argCount)
+		args = append(args, eventID)
+		argCount++
+	}
+	if filterKey != "" && filterValue != "" {
+		sqlStr += fmt.Sprintf(" AND a.details ->> $%d = $%d", argCount, argCount+1)
+		args = append(args, filterKey, filterValue)
+		argCount += 2
+	}
+	sqlStr += " ORDER BY a.played_at DESC"
+
+	rows, err := db.Query(sqlStr, args...)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, err)
+	}
+	defer rows.Close()
+
+	results := []Activity{}
+	for rows.Next() {
+		var a Activity
+		var detailsStr []byte
+		
+		// Scanの引数に &a.CoPlayerNames を追加 (pq.Arrayを使用)
+		err := rows.Scan(
+			&a.ID, &a.UserID, &a.Category, &a.EventID, &a.PlayedAt, &a.Prefecture, &a.LocationName, &a.PrimaryScore,
+			pq.Array(&a.ImageURLs),
+			&detailsStr,
+			pq.Array(&a.CoPlayerNames), 
+		)
+		if err != nil {
+			continue 
+		}
+
+		json.Unmarshal(detailsStr, &a.Details)
+		results = append(results, a)
+	}
+	return c.JSON(http.StatusOK, results)
+}
+
+func getRanking(c echo.Context) error {
+	// (変更なしのため省略。前回のコードのまま)
+	// ただし、前回提示したJOIN版を使っている前提です
+	category := c.QueryParam("category")
+	eventID := c.QueryParam("event_id")
+
+	if category == "" && eventID == "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "category or event_id is required"})
+	}
+
+	sortOrder := "DESC"
+	if category == "golf" {
+		sortOrder = "ASC"
+	}
+
+	whereClause := "WHERE 1=1"
+	args := []interface{}{}
+	argCount := 1
+
+	if eventID != "" {
+		whereClause += fmt.Sprintf(" AND a.event_id = $%d", argCount)
+		args = append(args, eventID)
+		argCount++
+	} else if category != "" {
+		whereClause += fmt.Sprintf(" AND a.category = $%d", argCount)
+		args = append(args, category)
+		argCount++
+	}
+
+	query := fmt.Sprintf(`
+		SELECT a.user_id, 
+			   u.display_name,
+			   AVG(a.primary_score) as avg_score, 
+			   MAX(a.primary_score) as max_score, 
+			   MIN(a.primary_score) as min_score,
+			   COUNT(*) as play_count
+		FROM activities a
+		LEFT JOIN users u ON a.user_id = u.username
+		%s
+		GROUP BY a.user_id, u.display_name 
+		ORDER BY avg_score %s`, whereClause, sortOrder)
+
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, err)
+	}
+	defer rows.Close()
+
+	rankings := []Ranking{}
+	for rows.Next() {
+		var r Ranking
+		var max, min float64
+		var displayName sql.NullString
+		err := rows.Scan(&r.UserID, &displayName, &r.AvgScore, &max, &min, &r.PlayCount)
+		if err != nil {
+			continue
+		}
+		if displayName.Valid {
+			r.DisplayName = displayName.String
+		} else {
+			r.DisplayName = "Unknown"
+		}
+		if category == "golf" {
+			r.BestScore = min
+		} else {
+			r.BestScore = max
+		}
+		rankings = append(rankings, r)
+	}
+	return c.JSON(http.StatusOK, rankings)
+}

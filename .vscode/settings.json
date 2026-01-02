@@ -1,0 +1,5 @@
+{
+    "dart.projectSearchDepth": 10,
+    "dart.flutterProjectPaths": ["./frontend"],
+    "dart.flutterSdkPath": "C:\\Users\\masa\\develop\\flutter"
+}
