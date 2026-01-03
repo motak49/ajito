@@ -43,8 +43,11 @@ dependencies:
   image_picker: ^1.2.1
   image: ^4.7.2
   fl_chart: ^1.1.1
+
   speech_to_text: ^7.2.0 # 追加
   permission_handler: ^11.3.0 # マイク権限管理用にあると便利
+
+  google_generative_ai: ^0.4.6 # Gemini API用
 
 dev_dependencies:
   flutter_test:
@@ -100,5 +103,4 @@ flutter:
   # see https://flutter.dev/to/font-from-package
 
   assets: 
-    - lib/img/
     - assets/images/

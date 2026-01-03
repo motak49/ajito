@@ -1,11 +1,16 @@
 import 'dart:convert';
+import 'dart:io';
+import 'package:image_picker/image_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import '../../helpers/database_helper.dart';
+import '../../services/gemini_service.dart';
 
-// ↓↓↓ ここがポイントです（searchフォルダの中のファイルを指定） ↓↓↓
+// 画面遷移先
 import 'search/golf_search_menu.dart'; 
 import 'golf_detail_screen.dart';
+// import 'score_input_screen.dart'; // ← 削除またはコメントアウト
+import 'golf_score_confirm_screen.dart'; // ★追加: 新しい確認画面
 
 // モデルクラス
 class GolfActivity {
@@ -46,7 +51,7 @@ class _GolfHomeScreenState extends State<GolfHomeScreen> {
   bool _isLoading = true;
 
   // 統計用
-  final int _bestScore = 0; // 0初期化に変更
+  final int _bestScore = 0; 
   final double _avgScore = 0.0;
   final int _rounds = 0;
 
@@ -58,16 +63,10 @@ class _GolfHomeScreenState extends State<GolfHomeScreen> {
 
   Future<void> _fetchGolfData() async {
     try {
-      // ★ ローカルDBから取得
       final List<Map<String, dynamic>> data = 
           await DatabaseHelper.instance.getActivities('golf');
       
-      // データ変換 (Map -> GolfActivity)
-      // ※ GolfActivity.fromJsonの実装によっては微調整が必要ですが
-      // 基本的にはローカルDBのカラム名とJSONのキーを合わせているのでそのままいけるはずです
       final items = data.map((e) {
-        // SQLiteから取り出した 'golf_data' は String なので、Mapに戻す必要があります
-        // DBヘルパー側でやっていない場合はここでパース
         final Map<String, dynamic> mutableMap = Map.from(e);
         if (mutableMap['golf_data'] is String) {
            mutableMap['golf_data'] = jsonDecode(mutableMap['golf_data']);
@@ -75,28 +74,195 @@ class _GolfHomeScreenState extends State<GolfHomeScreen> {
         return GolfActivity.fromJson(mutableMap);
       }).toList();
 
-      if (items.isNotEmpty) {
-        // ... (ベストスコア計算などは既存のまま) ...
+      if (mounted) {
         setState(() {
           _logs = items;
-          _isLoading = false;
-        });
-      } else {
-         setState(() {
-          _logs = [];
           _isLoading = false;
         });
       }
     } catch (e) {
       debugPrint('Error: $e');
-      setState(() => _isLoading = false);
+      if (mounted) setState(() => _isLoading = false);
     }
+  }
+
+  // ★ 画像選択〜解析〜遷移の処理
+  // _processImageRegistration メソッドの修正
+  Future<void> _processImageRegistration() async {
+    // 1. ソース選択ダイアログ (ここが source の定義です)
+    final ImageSource? source = await showDialog<ImageSource>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text("画像の選択"),
+        content: const Text("どちらから画像を読み込みますか？"),
+        actions: [
+          TextButton.icon(
+            icon: const Icon(Icons.photo_library),
+            label: const Text("ギャラリー"),
+            onPressed: () => Navigator.pop(ctx, ImageSource.gallery),
+          ),
+          TextButton.icon(
+            icon: const Icon(Icons.camera_alt),
+            label: const Text("カメラ"),
+            onPressed: () => Navigator.pop(ctx, ImageSource.camera),
+          ),
+        ],
+      ),
+    );
+
+    if (source == null) return; // キャンセルされた場合
+
+    // 2. 画像ピッカーの初期化 (ここが picker の定義です)
+    final picker = ImagePicker();
+    
+    // 3. 画像取得実行
+    final XFile? image = await picker.pickImage(source: source);
+    if (image == null) return;
+
+    // 4. ローディング表示
+    if (!mounted) return;
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => const Center(child: CircularProgressIndicator(color: Colors.white)),
+    );
+
+    try {
+      final File imageFile = File(image.path); // 画像ファイルオブジェクト作成
+      
+      // 5. Gemini解析
+      final result = await GeminiService().analyzeScoreCard(imageFile);
+      
+      // ローディング消去
+      if (mounted) Navigator.pop(context);
+
+      if (result != null) {
+        final String placeName = result['place_name'] ?? 'Unknown Course';
+        final DateTime date = DateTime.tryParse(result['play_date'] ?? '') ?? DateTime.now();
+        
+        // Par情報の取得
+        List<int> parsedPars = [];
+        if (result['pars'] != null) {
+           parsedPars = List<int>.from(result['pars']);
+        }
+        if (parsedPars.length != 18) {
+          parsedPars = [4, 4, 3, 4, 5, 4, 4, 3, 5, 4, 4, 3, 4, 5, 4, 4, 3, 5];
+        }
+
+        // スコア情報の取得（文字列のまま）
+        List<String> rawScores = [];
+        if (result['scores'] != null && (result['scores'] as List).isNotEmpty) {
+          List<dynamic> src = result['scores'][0];
+          for (int i = 0; i < 18; i++) {
+            if (i < src.length) {
+              rawScores.add(src[i].toString()); // 文字列のまま
+            } else {
+              rawScores.add("-"); // データなし
+            }
+          }
+        } else {
+          rawScores = List.filled(18, "-");
+        }
+
+        // パット数の取得
+        List<int> rawPutts = [];
+        if (result['putts'] != null && (result['putts'] as List).isNotEmpty) {
+          List<dynamic> src = result['putts'][0];
+          for (int i = 0; i < 18; i++) {
+             if (i < src.length && src[i] is int) {
+               rawPutts.add(src[i]);
+             } else {
+               rawPutts.add(0);
+             }
+          }
+        } else {
+          rawPutts = List.filled(18, 0);
+        }
+
+        // 6. 結果確認画面へ遷移
+        if (mounted) {
+          final bool? isSaved = await Navigator.push(
+            context,
+            MaterialPageRoute(
+              builder: (context) => GolfScoreConfirmScreen(
+                courseName: placeName,
+                date: date,
+                rawScores: rawScores, // 文字列リスト
+                pars: parsedPars,
+                putts: rawPutts,
+                sourceImage: imageFile, // 元画像
+              ),
+            ),
+          );
+          
+          if (isSaved == true) {
+            _fetchGolfData();
+          }
+        }
+      } else {
+        _showError("解析できませんでした。手入力してください。");
+      }
+    } catch (e) {
+      if (mounted) Navigator.pop(context); // エラー時もローディングを消す
+      _showError("エラーが発生しました: $e");
+    }
+  }
+
+  // 記号解析ヘルパーメソッド
+  int _parseScoreSymbol(dynamic input, int par) {
+    if (input is int) return input;
+    if (input is! String) return par; // 不明ならPar
+
+    String s = input.trim();
+    
+    // 1. そのまま数字の場合
+    if (int.tryParse(s) != null) {
+      return int.parse(s);
+    }
+
+    // 2. 記号の場合
+    switch (s) {
+      case '◎': 
+      case 'Double Circle':
+        return par - 2; // イーグル
+      case '○':
+      case 'O':
+      case 'Circle':
+        return par - 1; // バーディ
+      case '-':
+      case '－':
+      case 'Par':
+        return par;     // パー
+      case '△':
+      case 'Triangle':
+        return par + 1; // ボギー
+      case '□':
+      case 'Square':
+        return par + 2; // ダブルボギー
+      case '■':
+        return par + 3; // トリプルボギー
+    }
+
+    // 3. "+3" のような相対表記の場合
+    if (s.startsWith('+')) {
+      int? diff = int.tryParse(s.substring(1));
+      if (diff != null) return par + diff;
+    }
+
+    // マッチしなければParを返す（または0）
+    return par;
+  }
+  
+  void _showError(String msg) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       extendBodyBehindAppBar: true,
+      backgroundColor: const Color(0xFF1A1A1A), 
       appBar: AppBar(
         title: const Text('GOLF LIFE', style: TextStyle(fontWeight: FontWeight.bold, color: Colors.white)),
         backgroundColor: Colors.transparent,
@@ -109,8 +275,6 @@ class _GolfHomeScreenState extends State<GolfHomeScreen> {
       body: Container(
         decoration: const BoxDecoration(
           image: DecorationImage(
-            // 画像がない場合のエラー回避のため、一旦コメントアウトまたはエラーハンドリング推奨
-            // 実際に配置してあればコメントを外してください
             image: AssetImage('assets/images/golf_bg_top.png'), 
             fit: BoxFit.cover,
             colorFilter: ColorFilter.mode(Colors.black54, BlendMode.darken),
@@ -132,11 +296,10 @@ class _GolfHomeScreenState extends State<GolfHomeScreen> {
                       padding: const EdgeInsets.symmetric(horizontal: 20),
                       child: ElevatedButton.icon(
                         onPressed: () {
-                          // ここで検索画面へ遷移 (constは付けていません)
                           Navigator.push(
                             context,
                             MaterialPageRoute(builder: (context) => GolfSearchMenuScreen()),
-                          );
+                          ).then((_) => _fetchGolfData());
                         },
                         icon: const Icon(Icons.sports_golf, size: 28),
                         label: const Text("NEW ROUND", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
@@ -146,6 +309,25 @@ class _GolfHomeScreenState extends State<GolfHomeScreen> {
                           padding: const EdgeInsets.symmetric(vertical: 16),
                           shape: RoundedRectangleBorder(
                             borderRadius: BorderRadius.circular(12),
+                          ),
+                        ),
+                      ),
+                    ),
+
+                    // 画像から登録ボタン
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
+                      child: ElevatedButton.icon(
+                        onPressed: _processImageRegistration,
+                        icon: const Icon(Icons.camera_alt),
+                        label: const Text("画像から登録 (BETA)"),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.white24,
+                          foregroundColor: Colors.white,
+                          padding: const EdgeInsets.symmetric(vertical: 16),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(12),
+                            side: const BorderSide(color: Colors.white30),
                           ),
                         ),
                       ),
@@ -241,9 +423,7 @@ class _GolfHomeScreenState extends State<GolfHomeScreen> {
             style: const TextStyle(color: Colors.greenAccent, fontSize: 20, fontWeight: FontWeight.bold),
           ),          
         ),
-        // ↓↓↓ ★ここを追加してください ★ ↓↓↓
         onTap: () {
-        // IDを渡して詳細画面へ遷移
           Navigator.push(
             context,
             MaterialPageRoute(
@@ -251,7 +431,6 @@ class _GolfHomeScreenState extends State<GolfHomeScreen> {
             ),
           );
         },
-        // ↑↑↑ 追加ここまで ↑↑↑
       ),
     );
   }

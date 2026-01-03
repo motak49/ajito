@@ -11,6 +11,7 @@
         "fl_chart",
         "flutter",
         "flutter_localizations",
+        "google_generative_ai",
         "http",
         "image",
         "image_picker",
@@ -48,6 +49,13 @@
         "stream_channel",
         "test_api",
         "vector_math"
+      ]
+    },
+    {
+      "name": "google_generative_ai",
+      "version": "0.4.7",
+      "dependencies": [
+        "http"
       ]
     },
     {

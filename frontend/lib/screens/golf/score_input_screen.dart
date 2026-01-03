@@ -2,17 +2,23 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import '../../utils/voice_input_helper.dart';
 import '../../helpers/database_helper.dart';
+// ★追加: 完了画面への遷移用
+import 'golf_completion_screen.dart'; 
 
 class GolfScoreInputScreen extends StatefulWidget {
   final String courseName;
   final Map<String, dynamic> settings;
   final List<String> memberNames;
+  
+  // ★追加: AI解析済みのスコアデータ（任意）
+  final List<List<int>>? initialScores;
 
   const GolfScoreInputScreen({
     super.key,
     required this.courseName,
     required this.settings,
     required this.memberNames,
+    this.initialScores, // ★追加
   });
 
   @override
@@ -24,7 +30,7 @@ class _GolfScoreInputScreenState extends State<GolfScoreInputScreen> with Single
   final VoiceInputHelper _voiceHelper = VoiceInputHelper();
 
   int _currentHoleIndex = 0;
-  // 仮のホールデータ
+  // 仮のホールデータ (パー数)
   final List<int> _pars = [4, 4, 3, 4, 5, 4, 4, 3, 5, 4, 4, 3, 4, 5, 4, 4, 3, 5]; 
 
   late List<List<int>> _scores;
@@ -52,11 +58,29 @@ class _GolfScoreInputScreenState extends State<GolfScoreInputScreen> with Single
   }
 
   void _initData() {
-    // 全ホールのスコア初期値をParに設定
-    _scores = List.generate(
-      18, (holeIdx) => List.generate(widget.memberNames.length, (playerIdx) => _pars[holeIdx])
-    );
+    // MyStatsの初期化 (パット数など)
     _myStats = List.generate(18, (index) => {'putt': 2, 'ob': 0, 'bunker': 0});
+    
+    // スコアの初期化
+    // ★修正: AI解析データ(initialScores)があればそれをセット、なければParで埋める
+    if (widget.initialScores != null && widget.initialScores!.isNotEmpty) {
+      _scores = List.generate(18, (holeIdx) {
+        return List.generate(widget.memberNames.length, (playerIdx) {
+          // データが存在する範囲ならその値、なければPar
+          if (playerIdx < widget.initialScores!.length && holeIdx < widget.initialScores![playerIdx].length) {
+            final val = widget.initialScores![playerIdx][holeIdx];
+            // 0や極端な値が入っている場合はParに戻すなど、必要に応じて調整
+            return val > 0 ? val : _pars[holeIdx];
+          }
+          return _pars[holeIdx];
+        });
+      });
+    } else {
+      // 通常の初期化（全てPar）
+      _scores = List.generate(
+        18, (holeIdx) => List.generate(widget.memberNames.length, (playerIdx) => _pars[holeIdx])
+      );
+    }
     
     _tabController = TabController(length: 18, vsync: this);
     _tabController.addListener(() {
@@ -226,6 +250,7 @@ class _GolfScoreInputScreenState extends State<GolfScoreInputScreen> with Single
   // --- DB保存 ---
   Future<void> _saveToLocalDB() async {
     int totalScore = 0;
+    // 自分のスコア合計（0番目が自分と仮定）
     for (var s in _scores) {
       totalScore += s[0];
     }
@@ -251,14 +276,20 @@ class _GolfScoreInputScreenState extends State<GolfScoreInputScreen> with Single
 
     try {
       await DatabaseHelper.instance.createActivity(activityData);
+      
+      // ★修正: 保存成功後は完了画面へ遷移
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('戦績を保存しました')));
-        Navigator.of(context).popUntil((route) => route.isFirst);
+        Navigator.pushReplacement(
+          context,
+          MaterialPageRoute(builder: (context) => const GolfCompletionScreen()),
+        );
       }
     } catch (e) {
       debugPrint('DB Save Error: $e');
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('保存エラー: $e'), backgroundColor: Colors.red));
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('保存エラー: $e'), backgroundColor: Colors.red)
+        );
       }
     }
   }
